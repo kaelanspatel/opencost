@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/opencost/opencost/pkg/filter"
 	"github.com/opencost/opencost/pkg/log"
 )
 
@@ -36,13 +37,13 @@ type CloudCostItem struct {
 }
 
 func (cci *CloudCostItem) Key() string {
-	// TODO:cloudcost
 	return cci.Properties.Key()
 }
 
 type CloudCostItemSet struct {
 	CloudCostItems map[string]*CloudCostItem
 	Window         Window
+	Integration    string
 }
 
 // NewAssetSet instantiates a new AssetSet and, optionally, inserts
@@ -58,6 +59,23 @@ func NewCloudCostItemSet(start, end time.Time, cloudCostItems ...*CloudCostItem)
 	}
 
 	return ccis
+}
+
+func (ccis *CloudCostItemSet) Filter(filters filter.Filter[*CloudCostItem]) *CloudCostItemSet {
+	if ccis == nil {
+		return nil
+	}
+
+	result := NewCloudCostItemSet(*ccis.Window.start, *ccis.Window.end)
+
+	for _, cci := range ccis.CloudCostItems {
+		if filters.Matches(cci) {
+			// TODO:cloudcost ideally... this would be a Clone, but performance?
+			result.Insert(cci)
+		}
+	}
+
+	return result
 }
 
 func (ccis *CloudCostItemSet) Insert(that *CloudCostItem) error {
@@ -82,17 +100,47 @@ func (ccis *CloudCostItemSet) Insert(that *CloudCostItem) error {
 }
 
 func (ccis *CloudCostItemSet) Clone() *CloudCostItemSet {
-	// TODO
+	// TODO:cloudcost
 	return nil
 }
 
 func (ccis *CloudCostItemSet) IsEmpty() bool {
-	// TODO
-	return true
+	if ccis == nil {
+		return true
+	}
+
+	if len(ccis.CloudCostItems) == 0 {
+		return true
+	}
+
+	return false
 }
 
 func (ccis *CloudCostItemSet) GetWindow() Window {
 	return ccis.Window
+}
+
+func (ccas *CloudCostItemSet) Merge(that *CloudCostItemSet) (*CloudCostItemSet, error) {
+	if ccas == nil || that == nil {
+		return nil, fmt.Errorf("cannot merge nil CloudCostItemSets")
+	}
+
+	if !ccas.Window.Equal(that.Window) {
+		return nil, fmt.Errorf("cannot merge CloudCostItemSets with different windows")
+	}
+
+	start, end := *ccas.Window.Start(), *ccas.Window.End()
+	result := NewCloudCostItemSet(start, end)
+
+	for _, cca := range ccas.CloudCostItems {
+		result.Insert(cca)
+	}
+
+	for _, cca := range that.CloudCostItems {
+		result.Insert(cca)
+	}
+
+	return result, nil
 }
 
 // GetCloudCostItemSets

@@ -13,12 +13,11 @@ package kubecost
 
 import (
 	"fmt"
+	util "github.com/opencost/opencost/pkg/util"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
-
-	util "github.com/opencost/opencost/pkg/util"
 )
 
 const (
@@ -34,6 +33,12 @@ const (
 )
 
 const (
+	// AllocationCodecVersion is used for any resources listed in the Allocation version set
+	AllocationCodecVersion uint8 = 15
+
+	// AuditCodecVersion is used for any resources listed in the Audit version set
+	AuditCodecVersion uint8 = 1
+
 	// CloudCostAggregateCodecVersion is used for any resources listed in the CloudCostAggregate version set
 	CloudCostAggregateCodecVersion uint8 = 1
 
@@ -45,12 +50,6 @@ const (
 
 	// AssetsCodecVersion is used for any resources listed in the Assets version set
 	AssetsCodecVersion uint8 = 18
-
-	// AllocationCodecVersion is used for any resources listed in the Allocation version set
-	AllocationCodecVersion uint8 = 15
-
-	// AuditCodecVersion is used for any resources listed in the Audit version set
-	AuditCodecVersion uint8 = 1
 )
 
 //--------------------------------------------------------------------------
@@ -5823,6 +5822,12 @@ func (target *CloudCostItemSet) MarshalBinaryWithContext(ctx *EncodingContext) (
 	}
 	// --- [end][write][struct](Window) ---
 
+	if ctx.IsStringTable() {
+		b := ctx.Table.AddOrGet(target.Integration)
+		buff.WriteInt(b) // write table index
+	} else {
+		buff.WriteString(target.Integration) // write string
+	}
 	return nil
 }
 
@@ -5928,6 +5933,16 @@ func (target *CloudCostItemSet) UnmarshalBinaryWithContext(ctx *DecodingContext)
 	}
 	target.Window = *g
 	// --- [end][read][struct](Window) ---
+
+	var k string
+	if ctx.IsStringTable() {
+		l := buff.ReadInt() // read string index
+		k = ctx.Table[l]
+	} else {
+		k = buff.ReadString() // read string
+	}
+	h := k
+	target.Integration = h
 
 	return nil
 }
