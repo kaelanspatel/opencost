@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/kubecost/opencost/pkg/log"
-	"github.com/kubecost/opencost/pkg/util/timeutil"
+	"github.com/opencost/opencost/pkg/log"
+	"github.com/opencost/opencost/pkg/util/timeutil"
 )
 
 const (
@@ -17,6 +17,7 @@ const (
 	AWSClusterIDEnvVar       = "AWS_CLUSTER_ID"
 
 	KubecostNamespaceEnvVar        = "KUBECOST_NAMESPACE"
+	PodNameEnvVar                  = "POD_NAME"
 	ClusterIDEnvVar                = "CLUSTER_ID"
 	ClusterProfileEnvVar           = "CLUSTER_PROFILE"
 	PrometheusServerEndpointEnvVar = "PROMETHEUS_SERVER_ENDPOINT"
@@ -87,6 +88,8 @@ const (
 
 	ETLReadOnlyMode = "ETL_READ_ONLY"
 )
+
+var offsetRegex = regexp.MustCompile(`^(\+|-)(\d\d):(\d\d)$`)
 
 func IsETLReadOnlyMode() bool {
 	return GetBool(ETLReadOnlyMode, false)
@@ -206,6 +209,12 @@ func GetAWSClusterID() string {
 // represents the namespace the cost model exists in.
 func GetKubecostNamespace() string {
 	return Get(KubecostNamespaceEnvVar, "kubecost")
+}
+
+// GetPodName returns the name of the current running pod. If this environment variable is not set,
+// empty string is returned.
+func GetPodName() string {
+	return Get(PodNameEnvVar, "")
 }
 
 // GetClusterProfile returns the environment variable value for ClusterProfileEnvVar which
@@ -400,8 +409,7 @@ func GetParsedUTCOffset() time.Duration {
 	offset := time.Duration(0)
 
 	if offsetStr := GetUTCOffset(); offsetStr != "" {
-		regex := regexp.MustCompile(`^(\+|-)(\d\d):(\d\d)$`)
-		match := regex.FindStringSubmatch(offsetStr)
+		match := offsetRegex.FindStringSubmatch(offsetStr)
 		if match == nil {
 			log.Warnf("Illegal UTC offset: %s", offsetStr)
 			return offset

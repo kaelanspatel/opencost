@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kubecost/opencost/pkg/log"
+	"github.com/opencost/opencost/pkg/log"
 )
 
 // SummaryAllocation summarizes an Allocation, keeping only fields necessary
@@ -170,7 +170,7 @@ func (sa *SummaryAllocation) Clone() *SummaryAllocation {
 // no usage or cost, then efficiency is zero. If there is no request, but there
 // is usage or cost, then efficiency is 100%.
 func (sa *SummaryAllocation) CPUEfficiency() float64 {
-	if sa == nil {
+	if sa == nil || sa.IsIdle() {
 		return 0.0
 	}
 
@@ -245,7 +245,7 @@ func (sa *SummaryAllocation) Minutes() float64 {
 // no usage or cost, then efficiency is zero. If there is no request, but there
 // is usage or cost, then efficiency is 100%.
 func (sa *SummaryAllocation) RAMEfficiency() float64 {
-	if sa == nil {
+	if sa == nil || sa.IsIdle() {
 		return 0.0
 	}
 
@@ -272,7 +272,7 @@ func (sa *SummaryAllocation) TotalCost() float64 {
 // TotalEfficiency is the cost-weighted average of CPU and RAM efficiency. If
 // there is no cost at all, then efficiency is zero.
 func (sa *SummaryAllocation) TotalEfficiency() float64 {
-	if sa == nil {
+	if sa == nil || sa.IsIdle() {
 		return 0.0
 	}
 
@@ -301,18 +301,24 @@ type SummaryAllocationSet struct {
 // required for unfortunate reasons to do with performance and legacy order-of-
 // operations details, as well as the fact that reconciliation has been
 // pushed down to the conversion step between Allocation and SummaryAllocation.
-func NewSummaryAllocationSet(as *AllocationSet, ffs, kfs []AllocationMatchFunc, reconcile, reconcileNetwork bool) *SummaryAllocationSet {
+func NewSummaryAllocationSet(as *AllocationSet, filter AllocationFilter, kfs []AllocationMatchFunc, reconcile, reconcileNetwork bool) *SummaryAllocationSet {
 	if as == nil {
 		return nil
+	}
+
+	// Pre-flatten the filter so we can just check == nil to see if there are
+	// filters.
+	if filter != nil {
+		filter = filter.Flattened()
 	}
 
 	// If we can know the exact size of the map, use it. If filters or sharing
 	// functions are present, we can't know the size, so we make a default map.
 	var sasMap map[string]*SummaryAllocation
-	if len(ffs) == 0 && len(kfs) == 0 {
+	if filter == nil && len(kfs) == 0 {
 		// No filters, so make the map of summary allocations exactly the size
 		// of the origin allocation set.
-		sasMap = make(map[string]*SummaryAllocation, len(as.allocations))
+		sasMap = make(map[string]*SummaryAllocation, len(as.Allocations))
 	} else {
 		// There are filters, so start with a standard map
 		sasMap = make(map[string]*SummaryAllocation)
@@ -323,7 +329,7 @@ func NewSummaryAllocationSet(as *AllocationSet, ffs, kfs []AllocationMatchFunc, 
 		Window:             as.Window.Clone(),
 	}
 
-	for _, alloc := range as.allocations {
+	for _, alloc := range as.Allocations {
 		// First, detect if the allocation should be kept. If so, mark it as
 		// such, insert it, and continue.
 		shouldKeep := false
@@ -342,16 +348,8 @@ func NewSummaryAllocationSet(as *AllocationSet, ffs, kfs []AllocationMatchFunc, 
 
 		// If the allocation does not pass any of the given filter functions,
 		// do not insert it into the set.
-		shouldFilter := false
-		for _, ff := range ffs {
-			if !ff(alloc) {
-				shouldFilter = true
-				break
-			}
-		}
-		if shouldFilter {
+		if filter != nil && !filter.Matches(alloc) {
 			continue
-
 		}
 
 		err := sas.Insert(NewSummaryAllocation(alloc, reconcile, reconcileNetwork))
@@ -360,11 +358,11 @@ func NewSummaryAllocationSet(as *AllocationSet, ffs, kfs []AllocationMatchFunc, 
 		}
 	}
 
-	for key := range as.externalKeys {
+	for key := range as.ExternalKeys {
 		sas.externalKeys[key] = true
 	}
 
-	for key := range as.idleKeys {
+	for key := range as.IdleKeys {
 		sas.idleKeys[key] = true
 	}
 
@@ -473,6 +471,12 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 
 	if options.LabelConfig == nil {
 		options.LabelConfig = NewLabelConfig()
+	}
+
+	// Pre-flatten the filter so we can just check == nil to see if there are
+	// filters.
+	if options.Filter != nil {
+		options.Filter = options.Filter.Flattened()
 	}
 
 	// Check if we have any work to do; if not, then early return. If
@@ -672,7 +676,7 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 	// recorded by idle-key (cluster or node, depending on the IdleByNode
 	// option). Instantiating this map is a signal to record the totals.
 	var allocTotalsAfterFilters map[string]*AllocationTotals
-	if len(resultSet.idleKeys) > 0 && len(options.FilterFuncs) > 0 {
+	if len(resultSet.idleKeys) > 0 && options.Filter != nil {
 		allocTotalsAfterFilters = make(map[string]*AllocationTotals, len(resultSet.idleKeys))
 	}
 
@@ -961,11 +965,9 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 		// be filtered or not.
 		// TODO:CLEANUP do something about external cost, this stinks
 		ea := &Allocation{Properties: sa.Properties}
-		for _, ff := range options.FilterFuncs {
-			if !ff(ea) {
-				skip = true
-				break
-			}
+
+		if options.Filter != nil {
+			skip = !options.Filter.Matches(ea)
 		}
 
 		if !skip {
@@ -987,11 +989,8 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 		// be filtered or not.
 		// TODO:CLEANUP do something about external cost, this stinks
 		ia := &Allocation{Properties: isa.Properties}
-		for _, ff := range options.FilterFuncs {
-			if !ff(ia) {
-				skip = true
-				break
-			}
+		if options.Filter != nil {
+			skip = !options.Filter.Matches(ia)
 		}
 		if skip {
 			continue
@@ -1171,6 +1170,91 @@ func (sas *SummaryAllocationSet) TotalCost() float64 {
 	return tc
 }
 
+// RAMEfficiency func to calculate average RAM efficiency over SummaryAllocationSet
+func (sas *SummaryAllocationSet) RAMEfficiency() float64 {
+	if sas == nil {
+		return 0.0
+	}
+
+	sas.RLock()
+	defer sas.RUnlock()
+
+	totalRAMBytesUsage := 0.0
+	totalRAMBytesRequest := 0.0
+	totalRAMCost := 0.0
+	for _, sa := range sas.SummaryAllocations {
+		totalRAMBytesUsage += sa.RAMBytesUsageAverage
+		totalRAMBytesRequest += sa.RAMBytesRequestAverage
+		totalRAMCost += sa.RAMCost
+	}
+
+	if totalRAMBytesRequest > 0 {
+		return totalRAMBytesUsage / totalRAMBytesRequest
+	}
+
+	if totalRAMBytesUsage == 0.0 || totalRAMCost == 0.0 {
+		return 0.0
+	}
+
+	return 1.0
+}
+
+// CPUEfficiency func to calculate average CPU efficiency over SummaryAllocationSet
+func (sas *SummaryAllocationSet) CPUEfficiency() float64 {
+	if sas == nil {
+		return 0.0
+	}
+
+	sas.RLock()
+	defer sas.RUnlock()
+
+	totalCPUCoreUsage := 0.0
+	totalCPUCoreRequest := 0.0
+	totalCPUCost := 0.0
+	for _, sa := range sas.SummaryAllocations {
+		totalCPUCoreUsage += sa.CPUCoreUsageAverage
+		totalCPUCoreRequest += sa.CPUCoreRequestAverage
+		totalCPUCost += sa.CPUCost
+	}
+
+	if totalCPUCoreRequest > 0 {
+		return totalCPUCoreUsage / totalCPUCoreRequest
+	}
+
+	if totalCPUCoreUsage == 0.0 || totalCPUCost == 0.0 {
+		return 0.0
+	}
+
+	return 1.0
+}
+
+// TotalEfficiency func to calculate average Total efficiency over SummaryAllocationSet
+func (sas *SummaryAllocationSet) TotalEfficiency() float64 {
+	if sas == nil {
+		return 0.0
+	}
+
+	sas.RLock()
+	defer sas.RUnlock()
+
+	totalRAMCostEff := 0.0
+	totalCPUCostEff := 0.0
+	totalRAMCost := 0.0
+	totalCPUCost := 0.0
+	for _, sa := range sas.SummaryAllocations {
+		totalRAMCostEff += sa.RAMEfficiency() * sa.RAMCost
+		totalCPUCostEff += sa.CPUEfficiency() * sa.CPUCost
+		totalRAMCost += sa.RAMCost
+		totalCPUCost += sa.CPUCost
+	}
+
+	if totalRAMCost+totalCPUCost > 0 {
+		return (totalRAMCostEff + totalCPUCostEff) / (totalRAMCost + totalCPUCost)
+	}
+
+	return 0.0
+}
+
 // SummaryAllocationSetRange is a thread-safe slice of SummaryAllocationSets.
 type SummaryAllocationSetRange struct {
 	sync.RWMutex
@@ -1223,6 +1307,39 @@ func (sasr *SummaryAllocationSetRange) Accumulate() (*SummaryAllocationSet, erro
 
 	for _, sas := range sasr.SummaryAllocationSets {
 		result, err = result.Add(sas)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
+}
+
+// NewAccumulation clones the first available SummaryAllocationSet to use as the data structure to
+// accumulate the remaining data. This leaves the original SummaryAllocationSetRange intact.
+func (sasr *SummaryAllocationSetRange) NewAccumulation() (*SummaryAllocationSet, error) {
+	var result *SummaryAllocationSet
+	var err error
+
+	sasr.RLock()
+	defer sasr.RUnlock()
+
+	for _, sas := range sasr.SummaryAllocationSets {
+		// we want to clone the first summary allocation set, then just Add the others
+		// to the clone. We will eventually use the clone to create the set range.
+		if result == nil {
+			result = sas.Clone()
+			continue
+		}
+
+		// Copy if sas is non-nil
+		var sasCopy *SummaryAllocationSet = nil
+		if sas != nil {
+			sasCopy = sas.Clone()
+		}
+
+		// nil is ok to pass into Add
+		result, err = result.Add(sasCopy)
 		if err != nil {
 			return nil, err
 		}
@@ -1314,27 +1431,27 @@ func (sasr *SummaryAllocationSetRange) InsertExternalAllocations(that *Allocatio
 	}
 
 	var err error
-	that.Each(func(j int, thatAS *AllocationSet) {
+	for _, thatAS := range that.Allocations {
 		if thatAS == nil || err != nil {
-			return
+			continue
 		}
 
 		// Find matching AllocationSet in asr
 		i, ok := keys[thatAS.Window.String()]
 		if !ok {
 			err = fmt.Errorf("cannot merge AllocationSet into window that does not exist: %s", thatAS.Window.String())
-			return
+			continue
 		}
 		sas := sasr.SummaryAllocationSets[i]
 
 		// Insert each Allocation from the given set
-		thatAS.Each(func(k string, alloc *Allocation) {
+		for _, alloc := range thatAS.Allocations {
 			externalSA := NewSummaryAllocation(alloc, true, true)
 			// This error will be returned below
 			// TODO:CLEANUP should Each have early-error-return functionality?
 			err = sas.Insert(externalSA)
-		})
-	})
+		}
+	}
 
 	// err might be nil
 	return err

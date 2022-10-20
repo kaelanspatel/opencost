@@ -13,12 +13,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kubecost/opencost/pkg/clustercache"
-	"github.com/kubecost/opencost/pkg/env"
-	"github.com/kubecost/opencost/pkg/log"
-	"github.com/kubecost/opencost/pkg/util"
-	"github.com/kubecost/opencost/pkg/util/fileutil"
-	"github.com/kubecost/opencost/pkg/util/json"
+	"github.com/opencost/opencost/pkg/clustercache"
+	"github.com/opencost/opencost/pkg/env"
+	"github.com/opencost/opencost/pkg/log"
+	"github.com/opencost/opencost/pkg/util"
+	"github.com/opencost/opencost/pkg/util/fileutil"
+	"github.com/opencost/opencost/pkg/util/json"
 
 	"github.com/Azure/azure-sdk-for-go/services/preview/commerce/mgmt/2015-06-01-preview/commerce"
 	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2016-06-01/subscriptions"
@@ -37,6 +37,7 @@ const (
 	AzureDiskStandardStorageClass    = "standard_hdd"
 	defaultSpotLabel                 = "kubernetes.azure.com/scalesetpriority"
 	defaultSpotLabelValue            = "spot"
+	AzureStorageUpdateType           = "AzureStorage"
 )
 
 var (
@@ -54,6 +55,9 @@ var (
 		"us": "us",
 		"za": "southafrica",
 		"no": "norway",
+		"ch": "switzerland",
+		"de": "germany",
+		"ue": "uae",
 	}
 
 	//mtBasic, _     = regexp.Compile("^BASIC.A\\d+[_Promo]*$")
@@ -66,6 +70,10 @@ var (
 	mtStandardL, _ = regexp.Compile(`^Standard_L\d+[_v\d]*[_Promo]*$`)
 	mtStandardM, _ = regexp.Compile(`^Standard_M\d+[m|t|l]*s[_v\d]*[_Promo]*$`)
 	mtStandardN, _ = regexp.Compile(`^Standard_N[C|D|V]\d+r?[_v\d]*[_Promo]*$`)
+
+	// azure:///subscriptions/0badafdf-1234-abcd-wxyz-123456789/...
+	//  => 0badafdf-1234-abcd-wxyz-123456789
+	azureSubRegex = regexp.MustCompile("azure:///subscriptions/([^/]*)/*")
 )
 
 // List obtained by installing the Azure CLI tool "az", described here:
@@ -505,18 +513,8 @@ func (ask *AzureServiceKey) IsValid() bool {
 }
 
 // Loads the azure authentication via configuration or a secret set at install time.
-func (az *Azure) getAzureAuth(forceReload bool, cp *CustomPricing) (subscriptionID, clientID, clientSecret, tenantID string) {
-	// 1. Check config values first (set from frontend UI)
-	if cp.AzureSubscriptionID != "" && cp.AzureClientID != "" && cp.AzureClientSecret != "" && cp.AzureTenantID != "" {
-		subscriptionID = cp.AzureSubscriptionID
-		clientID = cp.AzureClientID
-		clientSecret = cp.AzureClientSecret
-		tenantID = cp.AzureTenantID
-
-		return
-	}
-
-	// 2. Check for secret
+func (az *Azure) getAzureRateCardAuth(forceReload bool, cp *CustomPricing) (subscriptionID, clientID, clientSecret, tenantID string) {
+	// 1. Check for secret (secret values will always be used if they are present)
 	s, _ := az.loadAzureAuthSecret(forceReload)
 	if s != nil && s.IsValid() {
 		subscriptionID = s.SubscriptionID
@@ -525,38 +523,64 @@ func (az *Azure) getAzureAuth(forceReload bool, cp *CustomPricing) (subscription
 		tenantID = s.ServiceKey.Tenant
 		return
 	}
+	// 2. Check config values (set though endpoint)
+	if cp.AzureSubscriptionID != "" && cp.AzureClientID != "" && cp.AzureClientSecret != "" && cp.AzureTenantID != "" {
+		subscriptionID = cp.AzureSubscriptionID
+		clientID = cp.AzureClientID
+		clientSecret = cp.AzureClientSecret
+		tenantID = cp.AzureTenantID
+		return
+	}
 
 	// 3. Empty values
 	return "", "", "", ""
 }
 
 // GetAzureStorageConfig retrieves storage config from secret and sets default values
-func (az *Azure) GetAzureStorageConfig(forceReload bool) (*AzureStorageConfig, error) {
-	// retrieve config for default subscription id
-	defaultSubscriptionID := ""
-	config, err := az.GetConfig()
-	if err == nil {
-		defaultSubscriptionID = config.AzureSubscriptionID
+func (az *Azure) GetAzureStorageConfig(forceReload bool, cp *CustomPricing) (*AzureStorageConfig, error) {
+	// default subscription id
+	defaultSubscriptionID := cp.AzureSubscriptionID
+
+	// 1. Check Config for storage set up
+	asc := &AzureStorageConfig{
+		SubscriptionId: cp.AzureStorageSubscriptionID,
+		AccountName:    cp.AzureStorageAccount,
+		AccessKey:      cp.AzureStorageAccessKey,
+		ContainerName:  cp.AzureStorageContainer,
+		ContainerPath:  cp.AzureContainerPath,
+		AzureCloud:     cp.AzureCloud,
 	}
 
-	// 1. Check for secret
-	s, err := az.loadAzureStorageConfig(forceReload)
-	if err != nil {
-		log.Errorf("Error, %s", err.Error())
-	}
-	if s != nil && s.AccessKey != "" && s.AccountName != "" && s.ContainerName != "" {
+	// check for required fields
+	if asc != nil && asc.AccessKey != "" && asc.AccountName != "" && asc.ContainerName != "" && asc.SubscriptionId != "" {
 		az.serviceAccountChecks.set("hasStorage", &ServiceAccountCheck{
 			Message: "Azure Storage Config exists",
 			Status:  true,
 		})
+		return asc, nil
+	}
 
+	// 2. Check for secret
+	asc, err := az.loadAzureStorageConfig(forceReload)
+	if err != nil {
+		log.Errorf("Error, %s", err.Error())
+	} else if asc != nil {
 		// To support already configured users, subscriptionID may not be set in secret in which case, the subscriptionID
 		// for the rate card API is used
-		if s.SubscriptionId == "" {
-			s.SubscriptionId = defaultSubscriptionID
+		if asc.SubscriptionId == "" {
+			asc.SubscriptionId = defaultSubscriptionID
 		}
-		return s, nil
+		// check for required fields
+		if asc.AccessKey != "" && asc.AccountName != "" && asc.ContainerName != "" && asc.SubscriptionId == "" {
+			az.serviceAccountChecks.set("hasStorage", &ServiceAccountCheck{
+				Message: "Azure Storage Config exists",
+				Status:  true,
+			})
+
+			return asc, nil
+		}
 	}
+
 	az.serviceAccountChecks.set("hasStorage", &ServiceAccountCheck{
 		Message: "Azure Storage Config exists",
 		Status:  false,
@@ -740,7 +764,7 @@ func (az *Azure) DownloadPricingData() error {
 	}
 
 	// Load the service provider keys
-	subscriptionID, clientID, clientSecret, tenantID := az.getAzureAuth(true, config)
+	subscriptionID, clientID, clientSecret, tenantID := az.getAzureRateCardAuth(false, config)
 	config.AzureSubscriptionID = subscriptionID
 	config.AzureClientID = clientID
 	config.AzureClientSecret = clientSecret
@@ -906,7 +930,7 @@ func (az *Azure) DownloadPricingData() error {
 
 	// There is no easy way of supporting Standard Azure-File, because it's billed per used GB
 	// this will set the price to "0" as a workaround to not spam with `Persistent Volume pricing not found for` error
-	// check https://github.com/kubecost/opencost/issues/159 for more information (same problem on AWS)
+	// check https://github.com/opencost/opencost/issues/159 for more information (same problem on AWS)
 	zeroPrice := "0.0"
 	for region := range regions {
 		key := region + "," + AzureFileStandardStorageClass
@@ -1062,22 +1086,13 @@ func (az *Azure) NetworkPricing() (*Network, error) {
 	}, nil
 }
 
+// LoadBalancerPricing on Azure, LoadBalancer services correspond to public IPs. For now the pricing of LoadBalancer
+// services will be that of a standard static public IP https://azure.microsoft.com/en-us/pricing/details/ip-addresses/.
+// Azure still has load balancers which follow the standard pricing scheme based on rules
+// https://azure.microsoft.com/en-us/pricing/details/load-balancer/, they are created on a per-cluster basis.
 func (azr *Azure) LoadBalancerPricing() (*LoadBalancer, error) {
-	fffrc := 0.025
-	afrc := 0.010
-	lbidc := 0.008
-
-	numForwardingRules := 1.0
-	dataIngressGB := 0.0
-
-	var totalCost float64
-	if numForwardingRules < 5 {
-		totalCost = fffrc*numForwardingRules + lbidc*dataIngressGB
-	} else {
-		totalCost = fffrc*5 + afrc*(numForwardingRules-5) + lbidc*dataIngressGB
-	}
 	return &LoadBalancer{
-		Cost: totalCost,
+		Cost: 0.005,
 	}, nil
 }
 
@@ -1170,27 +1185,42 @@ func (az *Azure) UpdateConfigFromConfigMap(a map[string]string) (*CustomPricing,
 }
 
 func (az *Azure) UpdateConfig(r io.Reader, updateType string) (*CustomPricing, error) {
-	defer az.DownloadPricingData()
-
 	return az.Config.Update(func(c *CustomPricing) error {
-		a := make(map[string]interface{})
-		err := json.NewDecoder(r).Decode(&a)
-		if err != nil {
-			return err
-		}
-		for k, v := range a {
-			kUpper := strings.Title(k) // Just so we consistently supply / receive the same values, uppercase the first letter.
-			vstr, ok := v.(string)
-			if ok {
-				err := SetCustomPricingField(c, kUpper, vstr)
-				if err != nil {
-					return err
+		if updateType == AzureStorageUpdateType {
+			asc := &AzureStorageConfig{}
+			err := json.NewDecoder(r).Decode(&asc)
+			if err != nil {
+				return err
+			}
+
+			c.AzureStorageSubscriptionID = asc.SubscriptionId
+			c.AzureStorageAccount = asc.AccountName
+			if asc.AccessKey != "" {
+				c.AzureStorageAccessKey = asc.AccessKey
+			}
+			c.AzureStorageContainer = asc.ContainerName
+			c.AzureContainerPath = asc.ContainerPath
+			c.AzureCloud = asc.AzureCloud
+		} else {
+			defer az.DownloadPricingData()
+			a := make(map[string]interface{})
+			err := json.NewDecoder(r).Decode(&a)
+			if err != nil {
+				return err
+			}
+			for k, v := range a {
+				kUpper := strings.Title(k) // Just so we consistently supply / receive the same values, uppercase the first letter.
+				vstr, ok := v.(string)
+				if ok {
+					err := SetCustomPricingField(c, kUpper, vstr)
+					if err != nil {
+						return err
+					}
+				} else {
+					return fmt.Errorf("type error while updating config for %s", kUpper)
 				}
-			} else {
-				return fmt.Errorf("type error while updating config for %s", kUpper)
 			}
 		}
-
 		if env.IsRemoteEnabled() {
 			err := UpdateClusterMeta(env.GetClusterID(), c.ClusterName)
 			if err != nil {
@@ -1297,10 +1327,7 @@ func (az *Azure) Regions() []string {
 }
 
 func parseAzureSubscriptionID(id string) string {
-	// azure:///subscriptions/0badafdf-1234-abcd-wxyz-123456789/...
-	//  => 0badafdf-1234-abcd-wxyz-123456789
-	rx := regexp.MustCompile("azure:///subscriptions/([^/]*)/*")
-	match := rx.FindStringSubmatch(id)
+	match := azureSubRegex.FindStringSubmatch(id)
 	if len(match) >= 2 {
 		return match[1]
 	}

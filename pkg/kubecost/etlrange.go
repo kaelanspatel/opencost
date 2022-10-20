@@ -2,8 +2,9 @@ package kubecost
 
 import (
 	"fmt"
-	"github.com/kubecost/opencost/pkg/util/json"
 	"sync"
+
+	"github.com/opencost/opencost/pkg/util/json"
 )
 
 // SetRange is a generic implementation of the SetRanges that act as containers. It covers the basic functionality that
@@ -81,7 +82,7 @@ func (r *SetRange[T]) IsEmpty() bool {
 // MarshalJSON converts SetRange to JSON
 func (r *SetRange[T]) MarshalJSON() ([]byte, error) {
 	if r == nil {
-		return nil, fmt.Errorf("SetRange: MarshalJSON: is nil")
+		return json.Marshal([]T{})
 	}
 	r.lock.RLock()
 	defer r.lock.RUnlock()

@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubecost/opencost/pkg/cloud"
-	"github.com/kubecost/opencost/pkg/config"
-	"github.com/kubecost/opencost/pkg/prom"
-	"github.com/kubecost/opencost/pkg/util"
+	"github.com/opencost/opencost/pkg/cloud"
+	"github.com/opencost/opencost/pkg/config"
+	"github.com/opencost/opencost/pkg/prom"
+	"github.com/opencost/opencost/pkg/util"
 
 	"github.com/davecgh/go-spew/spew"
 )
@@ -936,6 +936,63 @@ func TestAssetCustompricing(t *testing.T) {
 		},
 	}
 
+	pvAvgUsagePromResult := []*prom.QueryResult{
+		{
+			Metric: map[string]interface{}{
+				"cluster_id":            "cluster1",
+				"persistentvolumeclaim": "pv-claim1",
+				"namespace":             "ns1",
+			},
+			Values: []*util.Vector{
+				&util.Vector{
+					Timestamp: 0,
+					Value:     1.0,
+				},
+				&util.Vector{
+					Timestamp: 3600.0,
+					Value:     1.0,
+				},
+			},
+		},
+	}
+
+	pvMaxUsagePromResult := []*prom.QueryResult{
+		{
+			Metric: map[string]interface{}{
+				"cluster_id":            "cluster1",
+				"persistentvolumeclaim": "pv-claim1",
+				"namespace":             "ns1",
+			},
+			Values: []*util.Vector{
+				&util.Vector{
+					Timestamp: 0,
+					Value:     1.0,
+				},
+				&util.Vector{
+					Timestamp: 3600.0,
+					Value:     1.0,
+				},
+			},
+		},
+	}
+
+	pvInfoPromResult := []*prom.QueryResult{
+		{
+			Metric: map[string]interface{}{
+				"cluster_id":            "cluster1",
+				"persistentvolumeclaim": "pv-claim1",
+				"volumename":            "pvc1",
+				"namespace":             "ns1",
+			},
+			Values: []*util.Vector{
+				&util.Vector{
+					Timestamp: 0,
+					Value:     1.0,
+				},
+			},
+		},
+	}
+
 	gpuCountMap := map[NodeIdentifier]float64{
 		NodeIdentifier{
 			Cluster:    "cluster1",
@@ -1000,7 +1057,7 @@ func TestAssetCustompricing(t *testing.T) {
 			gpuResult := gpuMap[nodeKey]
 
 			diskMap := map[DiskIdentifier]*Disk{}
-			pvCosts(diskMap, time.Hour, pvMinsPromResult, pvSizePromResult, pvCostPromResult, testProvider)
+			pvCosts(diskMap, time.Hour, pvMinsPromResult, pvSizePromResult, pvCostPromResult, pvAvgUsagePromResult, pvMaxUsagePromResult, pvInfoPromResult, testProvider)
 
 			diskResult := diskMap[DiskIdentifier{"cluster1", "pvc1"}].Cost
 

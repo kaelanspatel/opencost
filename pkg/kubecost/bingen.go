@@ -24,13 +24,13 @@ package kubecost
 // @bingen:generate:Window
 
 // Asset Version Set: Includes Asset pipeline specific resources
-// @bingen:set[name=Assets,version=15]
+// @bingen:set[name=Assets,version=18]
 // @bingen:generate:Any
 // @bingen:generate:Asset
 // @bingen:generate:AssetLabels
 // @bingen:generate:AssetProperties
 // @bingen:generate:AssetProperty
-// @bingen:generate[stringtable]:AssetSet
+// @bingen:generate[stringtable,preprocess,postprocess]:AssetSet
 // @bingen:generate:AssetSetRange
 // @bingen:generate:Breakdown
 // @bingen:generate:Cloud
@@ -71,4 +71,4 @@ package kubecost
 // @bingen:generate:AuditSetRange
 // @bingen:end
 
-//go:generate bingen -package=kubecost -version=15 -buffer=github.com/kubecost/opencost/pkg/util
+//go:generate bingen -package=kubecost -version=15 -buffer=github.com/opencost/opencost/pkg/util

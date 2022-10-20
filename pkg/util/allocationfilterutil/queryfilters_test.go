@@ -3,9 +3,9 @@ package allocationfilterutil
 import (
 	"testing"
 
-	"github.com/kubecost/opencost/pkg/costmodel/clusters"
-	"github.com/kubecost/opencost/pkg/kubecost"
-	"github.com/kubecost/opencost/pkg/util/mapper"
+	"github.com/opencost/opencost/pkg/costmodel/clusters"
+	"github.com/opencost/opencost/pkg/kubecost"
+	"github.com/opencost/opencost/pkg/util/mapper"
 )
 
 type mockClusterMap struct {
@@ -365,21 +365,21 @@ func TestFiltersFromParamsV1(t *testing.T) {
 			},
 		},
 		{
-			name: "single department",
+			name: "single department, sanitization required",
 			qp: map[string]string{
 				"filterDepartments": "pa-1",
 			},
 			shouldMatch: []kubecost.Allocation{
 				allocGenerator(kubecost.AllocationProperties{
 					Labels: map[string]string{
-						"internal-product-umbrella": "pa-1",
+						"internal_product_umbrella": "pa-1",
 					},
 				}),
 			},
 			shouldNotMatch: []kubecost.Allocation{
 				allocGenerator(kubecost.AllocationProperties{
 					Labels: map[string]string{
-						"internal-product-umbrella": "ps-N",
+						"internal_product_umbrella": "ps-N",
 					},
 				}),
 			},
@@ -392,34 +392,34 @@ func TestFiltersFromParamsV1(t *testing.T) {
 			shouldMatch: []kubecost.Allocation{
 				allocGenerator(kubecost.AllocationProperties{
 					Labels: map[string]string{
-						"internal-product-umbrella": "pa-1",
+						"internal_product_umbrella": "pa-1",
 					},
 				}),
 			},
 			shouldNotMatch: []kubecost.Allocation{
 				allocGenerator(kubecost.AllocationProperties{
 					Labels: map[string]string{
-						"internal-product-umbrella": "ps-N",
+						"internal_product_umbrella": "ps-N",
 					},
 				}),
 			},
 		},
 		{
-			name: "single label",
+			name: "single label, sanitization required",
 			qp: map[string]string{
-				"filterLabels": "app:cost-analyzer",
+				"filterLabels": "app-a:cost-analyzer",
 			},
 			shouldMatch: []kubecost.Allocation{
 				allocGenerator(kubecost.AllocationProperties{
 					Labels: map[string]string{
-						"app": "cost-analyzer",
+						"app_a": "cost-analyzer",
 					},
 				}),
 			},
 			shouldNotMatch: []kubecost.Allocation{
 				allocGenerator(kubecost.AllocationProperties{
 					Labels: map[string]string{
-						"app": "foo",
+						"app_a": "foo",
 					},
 				}),
 				allocGenerator(kubecost.AllocationProperties{

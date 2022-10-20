@@ -3,11 +3,11 @@ package allocationfilterutil
 import (
 	"strings"
 
-	"github.com/kubecost/opencost/pkg/costmodel/clusters"
-	"github.com/kubecost/opencost/pkg/kubecost"
-	"github.com/kubecost/opencost/pkg/log"
-	"github.com/kubecost/opencost/pkg/prom"
-	"github.com/kubecost/opencost/pkg/util/httputil"
+	"github.com/opencost/opencost/pkg/costmodel/clusters"
+	"github.com/opencost/opencost/pkg/kubecost"
+	"github.com/opencost/opencost/pkg/log"
+	"github.com/opencost/opencost/pkg/prom"
+	"github.com/opencost/opencost/pkg/util/mapper"
 )
 
 // ============================================================================
@@ -41,7 +41,7 @@ func parseWildcardEnd(rawFilterValue string) (string, bool) {
 // filtering. This turns all `filterClusters=foo` arguments into the equivalent
 // of `clusterID = "foo" OR clusterName = "foo"`.
 func AllocationFilterFromParamsV1(
-	qp httputil.QueryParams,
+	qp mapper.PrimitiveMapReader,
 	labelConfig *kubecost.LabelConfig,
 	clusterMap clusters.ClusterMap,
 ) kubecost.AllocationFilter {
@@ -282,6 +282,7 @@ func filterV1LabelMappedFromList(rawFilterValues []string, labelName string) kub
 	filter := kubecost.AllocationFilterOr{
 		Filters: []kubecost.AllocationFilter{},
 	}
+	labelName = prom.SanitizeLabelName(labelName)
 
 	for _, filterValue := range rawFilterValues {
 		filterValue = strings.TrimSpace(filterValue)
@@ -322,7 +323,7 @@ func filterV1DoubleValueFromList(rawFilterValuesUnsplit []string, filterField ku
 				log.Warnf("illegal key/value filter (ignoring): %s", unsplit)
 				continue
 			}
-			key := prom.SanitizeLabelName(strings.TrimSpace(split[0]))
+			labelName := prom.SanitizeLabelName(strings.TrimSpace(split[0]))
 			val := strings.TrimSpace(split[1])
 			val, wildcard := parseWildcardEnd(val)
 
@@ -330,7 +331,7 @@ func filterV1DoubleValueFromList(rawFilterValuesUnsplit []string, filterField ku
 				Field: filterField,
 				// All v1 filters are equality comparisons
 				Op:    kubecost.FilterEquals,
-				Key:   key,
+				Key:   labelName,
 				Value: val,
 			}
 

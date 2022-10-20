@@ -5,13 +5,14 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/kubecost/opencost/pkg/kubecost"
-	"github.com/kubecost/opencost/pkg/util/timeutil"
+	"github.com/opencost/opencost/pkg/kubecost"
+	"github.com/opencost/opencost/pkg/util/timeutil"
+	"golang.org/x/exp/slices"
 
-	"github.com/kubecost/opencost/pkg/cloud"
-	"github.com/kubecost/opencost/pkg/env"
-	"github.com/kubecost/opencost/pkg/log"
-	"github.com/kubecost/opencost/pkg/prom"
+	"github.com/opencost/opencost/pkg/cloud"
+	"github.com/opencost/opencost/pkg/env"
+	"github.com/opencost/opencost/pkg/log"
+	"github.com/opencost/opencost/pkg/prom"
 
 	prometheus "github.com/prometheus/client_golang/api"
 )
@@ -106,16 +107,22 @@ func NewClusterCostsFromCumulative(cpu, gpu, ram, storage float64, window, offse
 }
 
 type Disk struct {
-	Cluster    string
-	Name       string
-	ProviderID string
-	Cost       float64
-	Bytes      float64
-	Local      bool
-	Start      time.Time
-	End        time.Time
-	Minutes    float64
-	Breakdown  *ClusterCostsBreakdown
+	Cluster        string
+	Name           string
+	ProviderID     string
+	StorageClass   string
+	VolumeName     string
+	ClaimName      string
+	ClaimNamespace string
+	Cost           float64
+	Bytes          float64
+	BytesUsedAvg   float64
+	BytesUsedMax   float64
+	Local          bool
+	Start          time.Time
+	End            time.Time
+	Minutes        float64
+	Breakdown      *ClusterCostsBreakdown
 }
 
 type DiskIdentifier struct {
@@ -136,8 +143,13 @@ func ClusterDisks(client prometheus.Client, provider cloud.Provider, start, end 
 	// minsPerResolution determines accuracy and resource use for the following
 	// queries. Smaller values (higher resolution) result in better accuracy,
 	// but more expensive queries, and vice-a-versa.
-	minsPerResolution := 1
-	resolution := time.Duration(minsPerResolution) * time.Minute
+	resolution := env.GetETLResolution()
+	//Ensuring if ETL_RESOLUTION_SECONDS is less than 60s default it to 1m
+	var minsPerResolution int
+	if minsPerResolution = int(resolution.Minutes()); int(resolution.Minutes()) == 0 {
+		minsPerResolution = 1
+		log.DedupedWarningf(3, "ClusterDisks(): Configured ETL resolution (%d seconds) is below the 60 seconds threshold. Overriding with 1 minute.", int(resolution.Seconds()))
+	}
 
 	// hourlyToCumulative is a scaling factor that, when multiplied by an hourly
 	// value, converts it to a cumulative value; i.e.
@@ -150,35 +162,89 @@ func ClusterDisks(client prometheus.Client, provider cloud.Provider, start, end 
 	ctx := prom.NewNamedContext(client, prom.ClusterContextName)
 	queryPVCost := fmt.Sprintf(`avg(avg_over_time(pv_hourly_cost[%s])) by (%s, persistentvolume,provider_id)`, durStr, env.GetPromClusterLabel())
 	queryPVSize := fmt.Sprintf(`avg(avg_over_time(kube_persistentvolume_capacity_bytes[%s])) by (%s, persistentvolume)`, durStr, env.GetPromClusterLabel())
-	queryActiveMins := fmt.Sprintf(`count(pv_hourly_cost) by (%s, persistentvolume)[%s:%dm]`, env.GetPromClusterLabel(), durStr, minsPerResolution)
-
+	queryActiveMins := fmt.Sprintf(`avg(kube_persistentvolume_capacity_bytes) by (%s, persistentvolume)[%s:%dm]`, env.GetPromClusterLabel(), durStr, minsPerResolution)
+	queryPVStorageClass := fmt.Sprintf(`avg(avg_over_time(kubecost_pv_info[%s])) by (%s, persistentvolume, storageclass)`, durStr, env.GetPromClusterLabel())
+	queryPVUsedAvg := fmt.Sprintf(`avg(avg_over_time(kubelet_volume_stats_used_bytes[%s])) by (%s, persistentvolumeclaim, namespace)`, durStr, env.GetPromClusterLabel())
+	queryPVUsedMax := fmt.Sprintf(`max(max_over_time(kubelet_volume_stats_used_bytes[%s])) by (%s, persistentvolumeclaim, namespace)`, durStr, env.GetPromClusterLabel())
+	queryPVCInfo := fmt.Sprintf(`avg(avg_over_time(kube_persistentvolumeclaim_info[%s])) by (%s, volumename, persistentvolumeclaim, namespace)`, durStr, env.GetPromClusterLabel())
 	queryLocalStorageCost := fmt.Sprintf(`sum_over_time(sum(container_fs_limit_bytes{device!="tmpfs", id="/"}) by (instance, %s)[%s:%dm]) / 1024 / 1024 / 1024 * %f * %f`, env.GetPromClusterLabel(), durStr, minsPerResolution, hourlyToCumulative, costPerGBHr)
 	queryLocalStorageUsedCost := fmt.Sprintf(`sum_over_time(sum(container_fs_usage_bytes{device!="tmpfs", id="/"}) by (instance, %s)[%s:%dm]) / 1024 / 1024 / 1024 * %f * %f`, env.GetPromClusterLabel(), durStr, minsPerResolution, hourlyToCumulative, costPerGBHr)
+	queryLocalStorageUsedAvg := fmt.Sprintf(`avg(avg_over_time(container_fs_usage_bytes{device!="tmpfs", id="/"}[%s])) by (instance, %s)`, durStr, env.GetPromClusterLabel())
+	queryLocalStorageUsedMax := fmt.Sprintf(`max(max_over_time(container_fs_usage_bytes{device!="tmpfs", id="/"}[%s])) by (instance, %s)`, durStr, env.GetPromClusterLabel())
 	queryLocalStorageBytes := fmt.Sprintf(`avg_over_time(sum(container_fs_limit_bytes{device!="tmpfs", id="/"}) by (instance, %s)[%s:%dm])`, env.GetPromClusterLabel(), durStr, minsPerResolution)
 	queryLocalActiveMins := fmt.Sprintf(`count(node_total_hourly_cost) by (%s, node)[%s:%dm]`, env.GetPromClusterLabel(), durStr, minsPerResolution)
 
 	resChPVCost := ctx.QueryAtTime(queryPVCost, t)
 	resChPVSize := ctx.QueryAtTime(queryPVSize, t)
 	resChActiveMins := ctx.QueryAtTime(queryActiveMins, t)
+	resChPVStorageClass := ctx.QueryAtTime(queryPVStorageClass, t)
+	resChPVUsedAvg := ctx.QueryAtTime(queryPVUsedAvg, t)
+	resChPVUsedMax := ctx.QueryAtTime(queryPVUsedMax, t)
+	resChPVCInfo := ctx.QueryAtTime(queryPVCInfo, t)
 	resChLocalStorageCost := ctx.QueryAtTime(queryLocalStorageCost, t)
 	resChLocalStorageUsedCost := ctx.QueryAtTime(queryLocalStorageUsedCost, t)
+	resChLocalStoreageUsedAvg := ctx.QueryAtTime(queryLocalStorageUsedAvg, t)
+	resChLocalStoreageUsedMax := ctx.QueryAtTime(queryLocalStorageUsedMax, t)
 	resChLocalStorageBytes := ctx.QueryAtTime(queryLocalStorageBytes, t)
 	resChLocalActiveMins := ctx.QueryAtTime(queryLocalActiveMins, t)
 
 	resPVCost, _ := resChPVCost.Await()
 	resPVSize, _ := resChPVSize.Await()
 	resActiveMins, _ := resChActiveMins.Await()
+	resPVStorageClass, _ := resChPVStorageClass.Await()
+	resPVUsedAvg, _ := resChPVUsedAvg.Await()
+	resPVUsedMax, _ := resChPVUsedMax.Await()
+	resPVCInfo, _ := resChPVCInfo.Await()
 	resLocalStorageCost, _ := resChLocalStorageCost.Await()
 	resLocalStorageUsedCost, _ := resChLocalStorageUsedCost.Await()
+	resLocalStorageUsedAvg, _ := resChLocalStoreageUsedAvg.Await()
+	resLocalStorageUsedMax, _ := resChLocalStoreageUsedMax.Await()
 	resLocalStorageBytes, _ := resChLocalStorageBytes.Await()
 	resLocalActiveMins, _ := resChLocalActiveMins.Await()
+
 	if ctx.HasErrors() {
 		return nil, ctx.ErrorCollection()
 	}
 
 	diskMap := map[DiskIdentifier]*Disk{}
 
-	pvCosts(diskMap, resolution, resActiveMins, resPVSize, resPVCost, provider)
+	for _, result := range resPVCInfo {
+		cluster, err := result.GetString(env.GetPromClusterLabel())
+		if err != nil {
+			cluster = env.GetClusterID()
+		}
+
+		volumeName, err := result.GetString("volumename")
+		if err != nil {
+			log.Warnf("ClusterDisks: pv claim data missing volumename")
+			continue
+		}
+		claimName, err := result.GetString("persistentvolumeclaim")
+		if err != nil {
+			log.Warnf("ClusterDisks: pv claim data missing persistentvolumeclaim")
+			continue
+		}
+		claimNamespace, err := result.GetString("namespace")
+		if err != nil {
+			log.Warnf("ClusterDisks: pv claim data missing namespace")
+			continue
+		}
+
+		key := DiskIdentifier{cluster, volumeName}
+		if _, ok := diskMap[key]; !ok {
+			diskMap[key] = &Disk{
+				Cluster:   cluster,
+				Name:      volumeName,
+				Breakdown: &ClusterCostsBreakdown{},
+			}
+		}
+
+		diskMap[key].VolumeName = volumeName
+		diskMap[key].ClaimName = claimName
+		diskMap[key].ClaimNamespace = claimNamespace
+	}
+
+	pvCosts(diskMap, resolution, resActiveMins, resPVSize, resPVCost, resPVUsedAvg, resPVUsedMax, resPVCInfo, provider)
 
 	for _, result := range resLocalStorageCost {
 		cluster, err := result.GetString(env.GetPromClusterLabel())
@@ -203,6 +269,9 @@ func ClusterDisks(client prometheus.Client, provider cloud.Provider, start, end 
 			}
 		}
 		diskMap[key].Cost += cost
+
+		//Assigning explicitly the storage class of local storage to local
+		diskMap[key].StorageClass = kubecost.LocalStorageClass
 	}
 
 	for _, result := range resLocalStorageUsedCost {
@@ -228,6 +297,56 @@ func ClusterDisks(client prometheus.Client, provider cloud.Provider, start, end 
 			}
 		}
 		diskMap[key].Breakdown.System = cost / diskMap[key].Cost
+	}
+
+	for _, result := range resLocalStorageUsedAvg {
+		cluster, err := result.GetString(env.GetPromClusterLabel())
+		if err != nil {
+			cluster = env.GetClusterID()
+		}
+
+		name, err := result.GetString("instance")
+		if err != nil {
+			log.Warnf("ClusterDisks: local storage data missing instance")
+			continue
+		}
+
+		bytesAvg := result.Values[0].Value
+		key := DiskIdentifier{cluster, name}
+		if _, ok := diskMap[key]; !ok {
+			diskMap[key] = &Disk{
+				Cluster:   cluster,
+				Name:      name,
+				Breakdown: &ClusterCostsBreakdown{},
+				Local:     true,
+			}
+		}
+		diskMap[key].BytesUsedAvg = bytesAvg
+	}
+
+	for _, result := range resLocalStorageUsedMax {
+		cluster, err := result.GetString(env.GetPromClusterLabel())
+		if err != nil {
+			cluster = env.GetClusterID()
+		}
+
+		name, err := result.GetString("instance")
+		if err != nil {
+			log.Warnf("ClusterDisks: local storage data missing instance")
+			continue
+		}
+
+		bytesMax := result.Values[0].Value
+		key := DiskIdentifier{cluster, name}
+		if _, ok := diskMap[key]; !ok {
+			diskMap[key] = &Disk{
+				Cluster:   cluster,
+				Name:      name,
+				Breakdown: &ClusterCostsBreakdown{},
+				Local:     true,
+			}
+		}
+		diskMap[key].BytesUsedMax = bytesMax
 	}
 
 	for _, result := range resLocalStorageBytes {
@@ -290,6 +409,43 @@ func ClusterDisks(client prometheus.Client, provider cloud.Provider, start, end 
 		diskMap[key].End = e
 		diskMap[key].Start = s
 		diskMap[key].Minutes = mins
+	}
+
+	var unTracedDiskLogData []DiskIdentifier
+	//Iterating through Persistent Volume given by custom metrics kubecost_pv_info and assign the storage class if known and __unknown__ if not populated.
+	for _, result := range resPVStorageClass {
+		cluster, err := result.GetString(env.GetPromClusterLabel())
+		if err != nil {
+			cluster = env.GetClusterID()
+		}
+
+		name, _ := result.GetString("persistentvolume")
+
+		key := DiskIdentifier{cluster, name}
+		if _, ok := diskMap[key]; !ok {
+			if !slices.Contains(unTracedDiskLogData, key) {
+				unTracedDiskLogData = append(unTracedDiskLogData, key)
+			}
+			continue
+		}
+
+		if len(result.Values) == 0 {
+			continue
+		}
+
+		storageClass, err := result.GetString("storageclass")
+
+		if err != nil {
+			diskMap[key].StorageClass = kubecost.UnknownStorageClass
+		} else {
+			diskMap[key].StorageClass = storageClass
+		}
+	}
+
+	// Logging the unidentified disk information outside the loop
+
+	for _, unIdentifiedDisk := range unTracedDiskLogData {
+		log.Warnf("ClusterDisks: Cluster %s has Storage Class information for unidentified disk %s or disk deleted from analysis", unIdentifiedDisk.Cluster, unIdentifiedDisk.Name)
 	}
 
 	for _, disk := range diskMap {
@@ -388,8 +544,13 @@ func ClusterNodes(cp cloud.Provider, client prometheus.Client, start, end time.T
 	// minsPerResolution determines accuracy and resource use for the following
 	// queries. Smaller values (higher resolution) result in better accuracy,
 	// but more expensive queries, and vice-a-versa.
-	minsPerResolution := 1
-	resolution := time.Duration(minsPerResolution) * time.Minute
+	resolution := env.GetETLResolution()
+	//Ensuring if ETL_RESOLUTION_SECONDS is less than 60s default it to 1m
+	var minsPerResolution int
+	if minsPerResolution = int(resolution.Minutes()); int(resolution.Minutes()) == 0 {
+		minsPerResolution = 1
+		log.DedupedWarningf(3, "ClusterNodes(): Configured ETL resolution (%d seconds) is below the 60 seconds threshold. Overriding with 1 minute.", int(resolution.Seconds()))
+	}
 
 	requiredCtx := prom.NewNamedContext(client, prom.ClusterContextName)
 	optionalCtx := prom.NewNamedContext(client, prom.ClusterOptionalContextName)
@@ -544,7 +705,13 @@ func ClusterLoadBalancers(client prometheus.Client, start, end time.Time) (map[L
 	// minsPerResolution determines accuracy and resource use for the following
 	// queries. Smaller values (higher resolution) result in better accuracy,
 	// but more expensive queries, and vice-a-versa.
-	minsPerResolution := 1
+	resolution := env.GetETLResolution()
+	//Ensuring if ETL_RESOLUTION_SECONDS is less than 60s default it to 1m
+	var minsPerResolution int
+	if minsPerResolution = int(resolution.Minutes()); int(resolution.Minutes()) == 0 {
+		minsPerResolution = 1
+		log.DedupedWarningf(3, "ClusterLoadBalancers(): Configured ETL resolution (%d seconds) is below the 60 seconds threshold. Overriding with 1 minute.", int(resolution.Seconds()))
+	}
 
 	ctx := prom.NewNamedContext(client, prom.ClusterContextName)
 
@@ -670,7 +837,13 @@ func (a *Accesses) ComputeClusterCosts(client prometheus.Client, provider cloud.
 	// minsPerResolution determines accuracy and resource use for the following
 	// queries. Smaller values (higher resolution) result in better accuracy,
 	// but more expensive queries, and vice-a-versa.
-	minsPerResolution := 5
+	resolution := env.GetETLResolution()
+	//Ensuring if ETL_RESOLUTION_SECONDS is less than 60s default it to 1m
+	var minsPerResolution int
+	if minsPerResolution = int(resolution.Minutes()); int(resolution.Minutes()) < 1 {
+		minsPerResolution = 1
+		log.DedupedWarningf(3, "ComputeClusterCosts(): Configured ETL resolution (%d seconds) is below the 60 seconds threshold. Overriding with 1 minute.", int(resolution.Seconds()))
+	}
 
 	// hourlyToCumulative is a scaling factor that, when multiplied by an hourly
 	// value, converts it to a cumulative value; i.e.
@@ -1114,7 +1287,7 @@ func ClusterCostsOverTime(cli prometheus.Client, provider cloud.Provider, startS
 	}, nil
 }
 
-func pvCosts(diskMap map[DiskIdentifier]*Disk, resolution time.Duration, resActiveMins, resPVSize, resPVCost []*prom.QueryResult, cp cloud.Provider) {
+func pvCosts(diskMap map[DiskIdentifier]*Disk, resolution time.Duration, resActiveMins, resPVSize, resPVCost, resPVUsedAvg, resPVUsedMax, resPVCInfo []*prom.QueryResult, cp cloud.Provider) {
 	for _, result := range resActiveMins {
 		cluster, err := result.GetString(env.GetPromClusterLabel())
 		if err != nil {
@@ -1223,5 +1396,127 @@ func pvCosts(diskMap map[DiskIdentifier]*Disk, resolution time.Duration, resActi
 		if providerID != "" {
 			diskMap[key].ProviderID = cloud.ParsePVID(providerID)
 		}
+	}
+
+	for _, result := range resPVUsedAvg {
+		cluster, err := result.GetString(env.GetPromClusterLabel())
+		if err != nil {
+			cluster = env.GetClusterID()
+		}
+
+		claimName, err := result.GetString("persistentvolumeclaim")
+		if err != nil {
+			log.Warnf("ClusterDisks: pv usage data missing persistentvolumeclaim")
+			continue
+		}
+		claimNamespace, err := result.GetString("namespace")
+		if err != nil {
+			log.Warnf("ClusterDisks: pv usage data missing namespace")
+			continue
+		}
+
+		var volumeName string
+
+		for _, thatRes := range resPVCInfo {
+
+			thatCluster, err := thatRes.GetString(env.GetPromClusterLabel())
+			if err != nil {
+				thatCluster = env.GetClusterID()
+			}
+
+			thatVolumeName, err := thatRes.GetString("volumename")
+			if err != nil {
+				log.Warnf("ClusterDisks: pv claim data missing volumename")
+				continue
+			}
+			thatClaimName, err := thatRes.GetString("persistentvolumeclaim")
+			if err != nil {
+				log.Warnf("ClusterDisks: pv claim data missing persistentvolumeclaim")
+				continue
+			}
+			thatClaimNamespace, err := thatRes.GetString("namespace")
+			if err != nil {
+				log.Warnf("ClusterDisks: pv claim data missing namespace")
+				continue
+			}
+
+			if cluster == thatCluster && claimName == thatClaimName && claimNamespace == thatClaimNamespace {
+				volumeName = thatVolumeName
+			}
+		}
+
+		usage := result.Values[0].Value
+
+		key := DiskIdentifier{cluster, volumeName}
+
+		if _, ok := diskMap[key]; !ok {
+			diskMap[key] = &Disk{
+				Cluster:   cluster,
+				Name:      volumeName,
+				Breakdown: &ClusterCostsBreakdown{},
+			}
+		}
+		diskMap[key].BytesUsedAvg = usage
+	}
+
+	for _, result := range resPVUsedMax {
+		cluster, err := result.GetString(env.GetPromClusterLabel())
+		if err != nil {
+			cluster = env.GetClusterID()
+		}
+
+		claimName, err := result.GetString("persistentvolumeclaim")
+		if err != nil {
+			log.Warnf("ClusterDisks: pv usage data missing persistentvolumeclaim")
+			continue
+		}
+		claimNamespace, err := result.GetString("namespace")
+		if err != nil {
+			log.Warnf("ClusterDisks: pv usage data missing namespace")
+			continue
+		}
+
+		var volumeName string
+
+		for _, thatRes := range resPVCInfo {
+
+			thatCluster, err := thatRes.GetString(env.GetPromClusterLabel())
+			if err != nil {
+				thatCluster = env.GetClusterID()
+			}
+
+			thatVolumeName, err := thatRes.GetString("volumename")
+			if err != nil {
+				log.Warnf("ClusterDisks: pv claim data missing volumename")
+				continue
+			}
+			thatClaimName, err := thatRes.GetString("persistentvolumeclaim")
+			if err != nil {
+				log.Warnf("ClusterDisks: pv claim data missing persistentvolumeclaim")
+				continue
+			}
+			thatClaimNamespace, err := thatRes.GetString("namespace")
+			if err != nil {
+				log.Warnf("ClusterDisks: pv claim data missing namespace")
+				continue
+			}
+
+			if cluster == thatCluster && claimName == thatClaimName && claimNamespace == thatClaimNamespace {
+				volumeName = thatVolumeName
+			}
+		}
+
+		usage := result.Values[0].Value
+
+		key := DiskIdentifier{cluster, volumeName}
+
+		if _, ok := diskMap[key]; !ok {
+			diskMap[key] = &Disk{
+				Cluster:   cluster,
+				Name:      volumeName,
+				Breakdown: &ClusterCostsBreakdown{},
+			}
+		}
+		diskMap[key].BytesUsedMax = usage
 	}
 }
